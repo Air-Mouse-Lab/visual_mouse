@@ -1,0 +1,235 @@
+# virtual_drawing_rainbow_fixed.py
+# macOS 내장 카메라 + MediaPipe Hands
+# 제스처:
+#  - 엄지+검지 pinch: 브러쉬(그리기)
+#  - 엄지+중지 pinch: 지우개(지우기)
+#  - 팔레트(상단)에서 색 선택: 팔레트 위에서 엄지+검지 pinch
+# 단축키: [c] 팔레트 토글, [r] 전체 지우기, [q] 종료, [+/-] 브러쉬 굵기 조절
+
+import cv2
+import numpy as np
+import mediapipe as mp
+import math
+
+# --------------------------
+# 설정값
+# --------------------------
+CAM_INDEX = 1
+W, H = 1280, 720
+
+BRUSH_THICKNESS = 12
+ERASER_THICKNESS = 42
+SMOOTHING_ALPHA = 0.35
+
+# 핀치 임계값(프레임 폭을 1.0으로 본 정규화 2D 거리)
+PINCH_DRAW_THRESH = 0.045   # 엄지-검지
+PINCH_ERASE_THRESH = 0.045  # 엄지-중지
+PINCH_HYST = 0.015          # 히스테리시스
+DEBOUNCE_FRAMES = 4
+
+SHOW_PALETTE = True
+
+# ----- 정확한 ROYGBIV (BGR) -----
+PALETTE = [
+    (0,   0, 255),   # R (빨강)
+    (0, 165, 255),   # O (주황)
+    (0, 255, 255),   # Y (노랑)
+    (0, 255,   0),   # G (초록)
+    (255, 0,   0),   # B (파랑)
+    (130, 0,  75),   # I (인디고)  RGB(75,0,130)->BGR(130,0,75)
+    (211, 0, 148),   # V (보라)    RGB(148,0,211)->BGR(211,0,148)
+]
+
+PALETTE_MARGIN = 12
+SWATCH_W, SWATCH_H = 72, 72
+SWATCH_GAP = 10
+
+mp_hands = mp.solutions.hands
+hands = mp_hands.Hands(
+    static_image_mode=False,
+    max_num_hands=1,
+    min_detection_confidence=0.6,
+    min_tracking_confidence=0.6,
+    model_complexity=1
+)
+
+def d2_xy(a, b):
+    """정규화 좌표 a,b 의 2D 거리 (x,y만 사용)"""
+    dx = a.x - b.x
+    dy = a.y - b.y
+    return math.hypot(dx, dy)
+
+class PinchState:
+    def __init__(self, thresh_on, hyst, debounce):
+        self.th_on = thresh_on
+        self.th_off = thresh_on + hyst
+        self.debounce = debounce
+        self.on_cnt = 0
+        self.off_cnt = 0
+        self.is_on = False
+    def update(self, d):
+        if d < self.th_on:
+            self.on_cnt += 1; self.off_cnt = 0
+        elif d > self.th_off:
+            self.off_cnt += 1; self.on_cnt = 0
+        if not self.is_on and self.on_cnt >= self.debounce:
+            self.is_on = True; self.on_cnt = self.off_cnt = 0
+        if self.is_on and self.off_cnt >= self.debounce:
+            self.is_on = False; self.on_cnt = self.off_cnt = 0
+        return self.is_on
+
+def ema(prev_px, cur_norm, alpha):
+    if prev_px is None:
+        return int(cur_norm[0]*W), int(cur_norm[1]*H)
+    prev_norm = (prev_px[0]/W, prev_px[1]/H)
+    x = (1-alpha)*prev_norm[0] + alpha*cur_norm[0]
+    y = (1-alpha)*prev_norm[1] + alpha*cur_norm[1]
+    return int(x*W), int(y*H)
+
+def draw_palette(ui_img, selected_idx):
+    x, y = PALETTE_MARGIN, PALETTE_MARGIN
+    rects = []
+    for i, color in enumerate(PALETTE):
+        r1 = (x, y); r2 = (x+SWATCH_W, y+SWATCH_H)
+        cv2.rectangle(ui_img, r1, r2, color, -1)
+        cv2.rectangle(ui_img, r1, r2, (35,35,35), 2)
+        if i == selected_idx:
+            cv2.rectangle(ui_img, (x-3,y-3), (x+SWATCH_W+3, y+SWATCH_H+3), (255,255,255), 2)
+        rects.append((r1, r2))
+        x += SWATCH_W + SWATCH_GAP
+    return rects
+
+def hit_test(rects, px, py):
+    for i,(r1,r2) in enumerate(rects):
+        if r1[0] <= px <= r2[0] and r1[1] <= py <= r2[1]:
+            return i
+    return None
+
+def main():
+    cap = cv2.VideoCapture(CAM_INDEX)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, W)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, H)
+
+    canvas = np.full((H, W, 3), 255, np.uint8)
+    ui = np.zeros_like(canvas)
+
+    brush_idx = 0
+    brush_color = PALETTE[brush_idx]
+    brush_thick = BRUSH_THICKNESS
+    eraser_thick = ERASER_THICKNESS
+
+    prev_px = None
+    pinch_draw = PinchState(PINCH_DRAW_THRESH, PINCH_HYST, DEBOUNCE_FRAMES)
+    pinch_erase = PinchState(PINCH_ERASE_THRESH, PINCH_HYST, DEBOUNCE_FRAMES)
+
+    global SHOW_PALETTE
+
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            print("카메라 프레임을 읽지 못했습니다.")
+            break
+
+        frame = cv2.flip(frame, 1)
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        ui[:] = 0
+
+        palette_rects = []
+        if SHOW_PALETTE:
+            palette_rects = draw_palette(ui, brush_idx)
+
+        res = hands.process(rgb)
+
+        draw_mode = False
+        erase_mode = False
+        cursor = None
+
+        if res.multi_hand_landmarks:
+            lm = res.multi_hand_landmarks[0].landmark
+            thumb = lm[mp_hands.HandLandmark.THUMB_TIP]
+            index = lm[mp_hands.HandLandmark.INDEX_FINGER_TIP]
+            middle = lm[mp_hands.HandLandmark.MIDDLE_FINGER_TIP]
+
+            # 2D 거리만 사용 (지우개 과민 방지)
+            d_draw = d2_xy(thumb, index)
+            d_erase = d2_xy(thumb, middle)
+
+            draw_mode = pinch_draw.update(d_draw)
+            erase_mode = pinch_erase.update(d_erase)
+
+            # 모드 상호 배타 (지우개 우선)
+            if erase_mode:
+                draw_mode = False
+
+            # 커서 = 검지 위치(EMA)
+            cursor = ema(prev_px, (index.x, index.y), SMOOTHING_ALPHA)
+
+            # 팔레트 선택: 팔레트 위에서 draw_mode가 막 켜졌을 때만 색 변경
+            if SHOW_PALETTE and cursor and draw_mode:
+                sel = hit_test(palette_rects, cursor[0], cursor[1])
+                if sel is not None:
+                    brush_idx = sel
+                    brush_color = PALETTE[brush_idx]
+
+            # 그리기/지우기
+            if cursor:
+                if draw_mode and not erase_mode:
+                    if prev_px is not None:
+                        cv2.line(canvas, prev_px, cursor, brush_color, brush_thick, lineType=cv2.LINE_AA)
+                    else:
+                        cv2.circle(canvas, cursor, max(1, brush_thick//2), brush_color, -1, lineType=cv2.LINE_AA)
+                elif erase_mode and not draw_mode:
+                    cv2.circle(canvas, cursor, eraser_thick, (255,255,255), -1, lineType=cv2.LINE_AA)
+
+            prev_px = cursor
+        else:
+            prev_px = None
+
+        # 미니 프리뷰(현재 색/굵기)
+        cv2.rectangle(ui, (W-120, 12), (W-48, 84), brush_color, -1)
+        cv2.rectangle(ui, (W-120, 12), (W-48, 84), (40,40,40), 2)
+        cv2.putText(ui, f"{brush_thick}px", (W-118, 106), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 2, cv2.LINE_AA)
+
+        # 출력 합성: 캔버스 + UI
+        out = canvas.copy()
+
+        # 커서 표시(현재 모드 색)
+        if cursor:
+            if erase_mode:
+                cur_color = (0,0,0)
+                cv2.circle(out, cursor, eraser_thick, (255,255,255), 2, cv2.LINE_AA)
+            elif draw_mode:
+                cur_color = brush_color
+            else:
+                cur_color = (180,180,180)
+            cv2.circle(out, cursor, 6, cur_color, -1, cv2.LINE_AA)
+
+        mask = ui.astype(bool)
+        out[mask] = cv2.addWeighted(out, 0.6, ui, 0.4, 0)[mask]
+
+        mode_txt = "ERASER" if erase_mode else "BRUSH" if draw_mode else "IDLE"
+        cv2.putText(out, f"Mode: {mode_txt}", (20, H-28), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (30,30,30), 2, cv2.LINE_AA)
+        cv2.putText(out, "Keys: [+/-] size  [c] palette  [r] clear  [q] quit", (260, H-28),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (60,60,60), 2, cv2.LINE_AA)
+
+        cv2.imshow("Virtual Drawing (macOS)", out)
+
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'):
+            break
+        elif key == ord('r'):
+            canvas[:] = 255
+        elif key == ord('c'):
+            SHOW_PALETTE = not SHOW_PALETTE
+        elif key in (ord('+'), ord('=')):   # 일부 키보드에서 '='가 + 역할
+            BRUSH_MAX = 80
+            brush_thick = min(BRUSH_MAX, brush_thick + 2)
+        elif key == ord('-'):
+            BRUSH_MIN = 2
+            brush_thick = max(BRUSH_MIN, brush_thick - 2)
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    main()
