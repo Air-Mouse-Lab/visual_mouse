@@ -1,0 +1,472 @@
+# virtual_mouse.py — macOS Quartz click-count DoubleClick + Single-queue + Enter fallback
+# + Right-Click(thumb+middle) + Drag + FAST(1€)/SMOOTH + Cursor offset
+import cv2, numpy as np, time, math, platform
+from collections import deque
+
+# ================= OS Mouse (Quartz 우선, PyAutoGUI 폴백) =================
+try:
+    import pyautogui
+    pyautogui.FAILSAFE = False
+    pyautogui.PAUSE = 0
+    HAVE_PYAUTO = True
+    SCREEN_W, SCREEN_H = pyautogui.size()
+except Exception:
+    HAVE_PYAUTO = False
+    SCREEN_W, SCREEN_H = 1920, 1080
+
+HAVE_QUARTZ = False
+if platform.system() == "Darwin":
+    try:
+        from Quartz import (
+            CGEventCreateMouseEvent, CGEventPost, CGEventSetIntegerValueField,
+            kCGHIDEventTap,
+            kCGEventLeftMouseDown, kCGEventLeftMouseUp,
+            kCGEventRightMouseDown, kCGEventRightMouseUp,
+            kCGMouseButtonLeft, kCGMouseButtonRight,
+            kCGMouseEventClickState
+        )
+        HAVE_QUARTZ = True
+    except Exception:
+        HAVE_QUARTZ = False
+
+def _q_point(x, y): return (float(x), float(y))
+
+def os_move_to(x, y):
+    if HAVE_PYAUTO:
+        pyautogui.moveTo(x, y, duration=0)
+
+def _q_left_click_at(x, y, click_count=1):
+    """Quartz로 클릭카운트를 지정해 확실한 클릭 전송 (Finder 호환)"""
+    if not HAVE_QUARTZ:
+        if HAVE_PYAUTO:
+            if click_count == 2: pyautogui.doubleClick(x=x, y=y, button='left')
+            else:                pyautogui.click(x=x, y=y, button='left')
+        return
+    e_down = CGEventCreateMouseEvent(None, kCGEventLeftMouseDown, _q_point(x, y), kCGMouseButtonLeft)
+    CGEventSetIntegerValueField(e_down, kCGMouseEventClickState, click_count)
+    CGEventPost(kCGHIDEventTap, e_down)
+    e_up   = CGEventCreateMouseEvent(None, kCGEventLeftMouseUp,   _q_point(x, y), kCGMouseButtonLeft)
+    CGEventSetIntegerValueField(e_up,   kCGMouseEventClickState, click_count)
+    CGEventPost(kCGHIDEventTap, e_up)
+
+def os_left_click(x, y):
+    os_move_to(x, y); _q_left_click_at(x, y, click_count=1)
+
+def os_left_double_click(x, y, interval=0.08):
+    """일부 앱은 1→(간격)→2 시퀀스를 기대 (Finder 안정)"""
+    os_move_to(x, y)
+    _q_left_click_at(x, y, click_count=1)
+    time.sleep(interval)
+    _q_left_click_at(x, y, click_count=2)
+
+def os_left_down(x, y):
+    if HAVE_QUARTZ:
+        e = CGEventCreateMouseEvent(None, kCGEventLeftMouseDown, _q_point(x, y), kCGMouseButtonLeft)
+        CGEventSetIntegerValueField(e, kCGMouseEventClickState, 1)
+        CGEventPost(kCGHIDEventTap, e)
+    elif HAVE_PYAUTO:
+        pyautogui.mouseDown(x=x, y=y, button='left')
+
+def os_left_up(x, y):
+    if HAVE_QUARTZ:
+        e = CGEventCreateMouseEvent(None, kCGEventLeftMouseUp, _q_point(x, y), kCGMouseButtonLeft)
+        CGEventSetIntegerValueField(e, kCGMouseEventClickState, 1)
+        CGEventPost(kCGHIDEventTap, e)
+    elif HAVE_PYAUTO:
+        pyautogui.mouseUp(x=x, y=y, button='left')
+
+def os_right_click(x, y):
+    os_move_to(x, y)
+    if HAVE_QUARTZ:
+        d = CGEventCreateMouseEvent(None, kCGEventRightMouseDown, _q_point(x, y), kCGMouseButtonRight)
+        CGEventSetIntegerValueField(d, kCGMouseEventClickState, 1)
+        CGEventPost(kCGHIDEventTap, d)
+        u = CGEventCreateMouseEvent(None, kCGEventRightMouseUp,   _q_point(x, y), kCGMouseButtonRight)
+        CGEventSetIntegerValueField(u, kCGMouseEventClickState, 1)
+        CGEventPost(kCGHIDEventTap, u)
+    elif HAVE_PYAUTO:
+        pyautogui.click(x=x, y=y, button='right')
+
+def os_key_enter():
+    """더블클릭 실패 폴백: 선택된 항목 열기"""
+    if HAVE_PYAUTO:
+        pyautogui.press('enter')
+
+# ================= MediaPipe =================
+import mediapipe as mp
+mp_hands = mp.solutions.hands
+mp_draw  = mp.solutions.drawing_utils
+mp_styles= mp.solutions.drawing_styles
+
+# ================= Camera & Mapping =================
+CAM_INDEX = 1
+FRAME_W, FRAME_H = 960, 540
+ROI_MARGIN = 80
+TARGET_FPS = 60
+CURSOR_OFFSET_Y = 25  # 커서를 검지 끝보다 살짝 위로
+
+# ================= FAST / SMOOTH =================
+# FAST (One-Euro)
+ONE_EURO_MINCUTOFF = 1.5
+ONE_EURO_BETA      = 0.003
+ONE_EURO_DCUTOFF   = 1.5
+DEADZONE_FAST_PX   = 2
+MAX_STEP_FAST      = 220
+PIXEL_SNAP         = True
+SEND_THRESHOLD_PX  = 1
+
+# SMOOTH
+SMOOTHING   = 0.85
+MEDIAN_WIN  = 3
+DEADZONE_PX = 8
+MAX_STEP_PX = 60
+
+# ================= Pinch thresholds =================
+# Left (thumb-index)
+PINCH_ON_STABLE_I,  PINCH_OFF_STABLE_I  = 0.070, 0.090
+PINCH_ON_SENS_I,    PINCH_OFF_SENS_I    = 0.060, 0.080
+# Right (thumb-middle)
+PINCH_ON_STABLE_M,  PINCH_OFF_STABLE_M  = 0.072, 0.095
+PINCH_ON_SENS_M,    PINCH_OFF_SENS_M    = 0.062, 0.085
+
+HOLD_TIME_FOR_DRAG   = 0.25
+HOLD_TIME_FOR_RCLICK = 0.20
+DEBOUNCE_CLICK_SEC   = 0.20
+
+# ================= Double-click tuning =================
+DOUBLECLICK_MAX_INTERVAL = 0.50   # 보류→확정 대기 시간
+DOUBLECLICK_MAX_MOVE_PX  = 15     # 두 클릭 사이 허용 이동
+DBL_INTERVAL_BETWEEN_CLICKS = 0.08  # 1클릭→2클릭 간격
+FREEZE_AROUND_CLICK_MS   = 90       # 클릭 전후 잠깐 이동 억제
+
+# ================= One-Euro filter =================
+def _alpha(cutoff, dt):
+    tau = 1.0 / (2.0 * math.pi * cutoff)
+    return 1.0 / (1.0 + tau / max(dt, 1e-6))
+
+class LowPass:
+    def __init__(self): self.y=None
+    def reset(self): self.y=None
+    def filter(self, x, a):
+        self.y = x if self.y is None else a*x + (1-a)*self.y
+        return self.y
+
+class OneEuro:
+    def __init__(self, mincutoff=1.0, beta=0.0, dcutoff=1.0):
+        self.mincutoff=mincutoff; self.beta=beta; self.dcutoff=dcutoff
+        self.x_f=LowPass(); self.dx_f=LowPass()
+        self.t_prev=None; self.x_prev=None
+    def reset(self):
+        self.x_f.reset(); self.dx_f.reset(); self.t_prev=None; self.x_prev=None
+    def __call__(self, x, t):
+        if self.t_prev is None:
+            self.t_prev=t; self.x_prev=x; return x
+        dt=max(1e-6, t-self.t_prev)
+        dx=(x-self.x_prev)/dt
+        a_d=_alpha(self.dcutoff, dt)
+        dx_hat=self.dx_f.filter(dx, a_d)
+        cutoff=self.mincutoff + self.beta*abs(dx_hat)
+        a=_alpha(cutoff, dt)
+        x_hat=self.x_f.filter(x, a)
+        self.t_prev=t; self.x_prev=x
+        return x_hat
+
+# ================= utils =================
+def lerp(a,b,t): return a + (b-a)*t
+def norm_dist(p1,p2): return math.hypot(p1[0]-p2[0], p1[1]-p2[1])
+def clamp(v,lo,hi): return max(lo, min(hi, v))
+def roi_bounds(w,h,margin): return (margin, margin, w-margin, h-margin)
+
+# ================= Main =================
+def main():
+    cap = cv2.VideoCapture(CAM_INDEX)
+    if not cap.isOpened():
+        print("❌ 카메라를 열 수 없습니다. CAM_INDEX 확인."); return
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_W)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_H)
+    cap.set(cv2.CAP_PROP_FPS, TARGET_FPS)
+    cv2.setUseOptimized(True)
+
+    with mp_hands.Hands(static_image_mode=False,
+                        max_num_hands=1,
+                        min_detection_confidence=0.6,
+                        min_tracking_confidence=0.6) as hands:
+
+        # 상태
+        os_mouse_enabled = False
+        show_roi = True
+        sensitive = False
+        i_on, i_off = PINCH_ON_STABLE_I, PINCH_OFF_STABLE_I
+        m_on, m_off = PINCH_ON_STABLE_M, PINCH_OFF_STABLE_M
+
+        dragging = False
+        pinch_i_state = False
+        pinch_m_state = False
+        pinch_i_start = None
+        pinch_m_start = None
+
+        last_left_click_time  = 0.0
+        last_right_click_time = 0.0
+
+        # 싱글 보류(더블클릭 판정용)
+        pending_single = False
+        pending_time   = 0.0
+        pending_pos    = None
+
+        suppress_moves_until = 0.0
+
+        # 모드/필터
+        mode_fast = True
+        euro_x = OneEuro(ONE_EURO_MINCUTOFF, ONE_EURO_BETA, ONE_EURO_DCUTOFF)
+        euro_y = OneEuro(ONE_EURO_MINCUTOFF, ONE_EURO_BETA, ONE_EURO_DCUTOFF)
+        prev_sent_px = None
+
+        prev_x = prev_y = None
+        raw_buf = deque(maxlen=MEDIAN_WIN)
+
+        ptime = 0
+
+        while True:
+            ok, frame = cap.read()
+            if not ok: break
+            frame = cv2.flip(frame, 1)
+            h, w = frame.shape[:2]
+
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            res = hands.process(rgb)
+
+            cursor_px = None
+            pinch_i_now = False
+            pinch_m_now = False
+            handLms = None
+
+            if res.multi_hand_landmarks:
+                handLms = res.multi_hand_landmarks[0]
+                lm = [(int(pt.x*w), int(pt.y*h)) for pt in handLms.landmark]
+
+                # 랜드마크
+                ix, iy = lm[8]          # index tip
+                mx_tip, my_tip = lm[12] # middle tip
+                tx, ty = lm[4]          # thumb tip
+
+                # 원본(핀치 계산용)
+                ix_raw, iy_raw = ix, iy
+                mx_raw, my_raw = mx_tip, my_tip
+                tx_raw, ty_raw = tx, ty
+
+                # 커서 보정
+                iy -= CURSOR_OFFSET_Y
+                if iy < 0: iy = 0
+
+                # ROI
+                x1, y1, x2, y2 = roi_bounds(w, h, ROI_MARGIN)
+                ix = clamp(ix, x1, x2); iy = clamp(iy, y1, y2)
+
+                # 프레임→스크린
+                sx = np.interp(ix, [x1, x2], [0, SCREEN_W])
+                sy = np.interp(iy, [y1, y2], [0, SCREEN_H])
+
+                now_t = time.time()
+
+                # 좌표 파이프라인
+                if mode_fast:
+                    fx = euro_x(sx, now_t); fy = euro_y(sy, now_t)
+                    cur_x, cur_y = fx, fy
+                else:
+                    raw_buf.append((sx, sy))
+                    mxs = np.median([p[0] for p in raw_buf]); mys = np.median([p[1] for p in raw_buf])
+                    if prev_x is not None and math.hypot(mxs-prev_x, mys-prev_y) < DEADZONE_PX:
+                        mxs, mys = prev_x, prev_y
+                    if prev_x is not None:
+                        dx, dy = mxs-prev_x, mys-prev_y
+                        dist = math.hypot(dx,dy)
+                        if dist > MAX_STEP_PX:
+                            s = MAX_STEP_PX/dist; mxs = prev_x + dx*s; mys = prev_y + dy*s
+                    if prev_x is None:
+                        cur_x, cur_y = mxs, mys
+                    else:
+                        cur_x = lerp(prev_x, mxs, 1.0 - SMOOTHING)
+                        cur_y = lerp(prev_y, mys, 1.0 - SMOOTHING)
+                    prev_x, prev_y = cur_x, cur_y
+
+                # 표시 좌표
+                vis_x = int(np.interp(cur_x, [0, SCREEN_W], [0, w]))
+                vis_y = int(np.interp(cur_y, [0, SCREEN_H], [0, h]))
+                cursor_px = (vis_x, vis_y)
+
+                # 핀치 판정(원본 좌표)
+                nd_i = norm_dist((ix_raw/w, iy_raw/h), (tx_raw/w, ty_raw/h))
+                if pinch_i_state:
+                    pinch_i_now = nd_i < i_off; pinch_i_state = pinch_i_now
+                else:
+                    pinch_i_now = nd_i < i_on
+                    if pinch_i_now: pinch_i_state = True
+
+                nd_m = norm_dist((mx_raw/w, my_raw/h), (tx_raw/w, ty_raw/h))
+                if pinch_m_state:
+                    pinch_m_now = nd_m < m_off; pinch_m_state = pinch_m_now
+                else:
+                    pinch_m_now = nd_m < m_on
+                    if pinch_m_now: pinch_m_state = True
+
+                # ---------------- OS 마우스 제어 ----------------
+                if os_mouse_enabled and (HAVE_QUARTZ or HAVE_PYAUTO):
+                    now = time.time()
+                    tx_px = round(cur_x) if PIXEL_SNAP else cur_x
+                    ty_px = round(cur_y) if PIXEL_SNAP else cur_y
+
+                    # 이동(클릭 전후 억제)
+                    if now >= suppress_moves_until:
+                        if prev_sent_px is None or math.hypot(tx_px - (prev_sent_px[0] if prev_sent_px else 0),
+                                                              ty_px - (prev_sent_px[1] if prev_sent_px else 0)) >= SEND_THRESHOLD_PX:
+                            if prev_sent_px is not None:
+                                dist = math.hypot(tx_px - prev_sent_px[0], ty_px - prev_sent_px[1])
+                                if dist > MAX_STEP_FAST:
+                                    s = MAX_STEP_FAST / dist
+                                    tx_px = prev_sent_px[0] + (tx_px - prev_sent_px[0]) * s
+                                    ty_px = prev_sent_px[1] + (ty_px - prev_sent_px[1]) * s
+                            if dragging and HAVE_PYAUTO:
+                                pyautogui.dragTo(tx_px, ty_px, duration=0, button='left')
+                            else:
+                                os_move_to(tx_px, ty_px)
+                            prev_sent_px = (tx_px, ty_px)
+
+                    # 우클릭(엄지+중지) 우선
+                    if pinch_m_now and not dragging:
+                        if pinch_m_start is None: pinch_m_start = now
+                    else:
+                        if pinch_m_start is not None:
+                            held = now - pinch_m_start
+                            if held <= HOLD_TIME_FOR_RCLICK and (now - last_right_click_time) > DEBOUNCE_CLICK_SEC:
+                                x, y = prev_sent_px if prev_sent_px else (tx_px, ty_px)
+                                os_right_click(x, y)
+                                last_right_click_time = now
+                                suppress_moves_until = now + FREEZE_AROUND_CLICK_MS/1000.0
+                            pinch_m_start = None
+
+                    # 왼클릭/드래그/더블클릭
+                    if not pinch_m_now:
+                        if pinch_i_now:
+                            if pinch_i_start is None: pinch_i_start = now
+                            held = now - pinch_i_start
+                            if held > HOLD_TIME_FOR_DRAG and not dragging:
+                                pending_single = False; pending_pos = None
+                                x, y = prev_sent_px if prev_sent_px else (tx_px, ty_px)
+                                os_move_to(x, y); os_left_down(x, y)
+                                dragging = True
+                                suppress_moves_until = now + FREEZE_AROUND_CLICK_MS/1000.0
+                        else:
+                            if pinch_i_start is not None:
+                                held = now - pinch_i_start
+                                if not dragging and held <= HOLD_TIME_FOR_DRAG:
+                                    # 2연타 판정
+                                    if pending_single and (now - pending_time) <= DOUBLECLICK_MAX_INTERVAL:
+                                        moved = math.hypot(
+                                            ((prev_sent_px[0]-pending_pos[0]) if (prev_sent_px and pending_pos) else 0),
+                                            ((prev_sent_px[1]-pending_pos[1]) if (prev_sent_px and pending_pos) else 0)
+                                        )
+                                        if moved <= DOUBLECLICK_MAX_MOVE_PX:
+                                            x, y = pending_pos if pending_pos else (tx_px, ty_px)
+                                            # 더블클릭 시도 → 실패 시 Enter 폴백
+                                            try:
+                                                os_left_double_click(x, y, interval=DBL_INTERVAL_BETWEEN_CLICKS)
+                                            except Exception:
+                                                os_left_click(x, y); time.sleep(0.05); os_key_enter()
+                                            last_left_click_time = now
+                                            pending_single = False; pending_pos = None
+                                            suppress_moves_until = time.time() + FREEZE_AROUND_CLICK_MS/1000.0
+                                        else:
+                                            # 너무 멀면 새 보류
+                                            pending_time = now; pending_pos = prev_sent_px
+                                    else:
+                                        # 첫 클릭 보류 시작
+                                        pending_single = True
+                                        pending_time = now
+                                        pending_pos  = prev_sent_px
+                                pinch_i_start = None
+
+                    # 보류 싱글 확정
+                    if pending_single and (now - pending_time) > DOUBLECLICK_MAX_INTERVAL:
+                        if (now - last_left_click_time) > DEBOUNCE_CLICK_SEC:
+                            x, y = pending_pos if pending_pos else (tx_px, ty_px)
+                            os_left_click(x, y)
+                            last_left_click_time = now
+                            suppress_moves_until = now + FREEZE_AROUND_CLICK_MS/1000.0
+                        pending_single = False; pending_pos = None
+
+                    # 드래그 종료
+                    if not pinch_i_now and dragging:
+                        x, y = prev_sent_px if prev_sent_px else (tx_px, ty_px)
+                        os_left_up(x, y); dragging=False
+                        suppress_moves_until = now + FREEZE_AROUND_CLICK_MS/1000.0
+
+                # 디버그 랜드마크
+                if handLms is not None:
+                    mp_draw.draw_landmarks(
+                        frame, handLms, mp_hands.HAND_CONNECTIONS,
+                        mp_styles.get_default_hand_landmarks_style(),
+                        mp_styles.get_default_hand_connections_style()
+                    )
+
+            # ROI 박스
+            if show_roi:
+                x1,y1,x2,y2 = ROI_MARGIN, ROI_MARGIN, w-ROI_MARGIN, h-ROI_MARGIN
+                cv2.rectangle(frame, (x1,y1),(x2,y2), (80,80,80),1)
+                cv2.putText(frame, "Move inside the box for best control",
+                            (x1+10, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (80,80,80),1)
+
+            # 가상 커서
+            if cursor_px is not None:
+                color = (0,255,0)
+                if pinch_m_state or pinch_m_now: color=(0,165,255)
+                elif pinch_i_state or pinch_i_now or dragging: color=(0,140,255)
+                cv2.circle(frame, cursor_px, 10, color, -1)
+                cv2.circle(frame, cursor_px, 20, color, 2)
+
+            # 상태 텍스트
+            ctime = time.time()
+            fps = 1.0 / (ctime - ptime) if ptime else 0.0
+            ptime = ctime
+            status = [
+                f"MODE: {'FAST(1€)' if mode_fast else 'SMOOTH'}",
+                f"FPS: {fps:.1f}",
+                f"OS Mouse: {'ON' if os_mouse_enabled and (HAVE_QUARTZ or HAVE_PYAUTO) else 'OFF'}",
+                f"L/R Sens: {'SENS' if sensitive else 'STABLE'}",
+                f"Drag: {'ON' if dragging else 'OFF'}",
+                "Keys: [l] mode, [m] OS mouse, [c] sens, [r] ROI, [q] quit",
+                f"Quartz: {'ON' if HAVE_QUARTZ else 'OFF'}"
+            ]
+            for i,t in enumerate(status):
+                cv2.putText(frame, t, (10, 20+i*20),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
+
+            cv2.imshow("Virtual Mouse (Hand Tracking)", frame)
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'): break
+            elif key == ord('l'):
+                mode_fast = not mode_fast
+                euro_x.reset(); euro_y.reset()
+                prev_sent_px=None; prev_x=prev_y=None; raw_buf.clear()
+            elif key == ord('m'):
+                os_mouse_enabled = not os_mouse_enabled
+                if os_mouse_enabled and not (HAVE_QUARTZ or HAVE_PYAUTO):
+                    print("⚠️ 마우스 제어 모듈이 없음(Quartz/PyAutoGUI).")
+            elif key == ord('c'):
+                sensitive = not sensitive
+                if sensitive:
+                    i_on,i_off = PINCH_ON_SENS_I, PINCH_OFF_SENS_I
+                    m_on,m_off = PINCH_ON_SENS_M, PINCH_OFF_SENS_M
+                else:
+                    i_on,i_off = PINCH_ON_STABLE_I, PINCH_OFF_STABLE_I
+                    m_on,m_off = PINCH_ON_STABLE_M, PINCH_OFF_STABLE_M
+            elif key == ord('r'):
+                show_roi = not show_roi
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    main()
+
+
+# python "/Users/shin-yeonho/Desktop/동아리 자료/하이퍼 - 프로젝트/virtual_mouse.py" 를 입력하여 실행
