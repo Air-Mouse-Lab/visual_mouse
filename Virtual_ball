@@ -1,0 +1,164 @@
+import time, math
+import numpy as np
+import cv2
+import mediapipe as mp
+
+# ---------------------- 설정 ----------------------
+CAM_INDEX_CANDIDATES = [1, 2]  # 0이 안 잡히면 1→2 시도
+FRAME_W, FRAME_H = 1280, 720
+MIRROR = True
+
+PINCH_THRESH = 0.06   # 엄지-검지 정규화 거리
+SMOOTHING    = 0.35   # 손 좌표 EMA
+
+REST_COEF     = 0.82  # 탄성(반발) 계수 0~1
+GRAVITY       = 2000.0  # px/s^2 (아래 +)
+AIR_DRAG      = 0.996   # 프레임당 속도 감쇠
+FRICTION_WALL = 0.90    # 벽 충돌 시 접선 감쇠
+RADIUS_PX     = 60      # 공 반지름
+
+# ---------------------- 유틸 ----------------------
+def ema(prev, cur, a):
+    if prev is None: return cur
+    return prev*(1-a) + cur*a
+
+def l2(p, q):
+    return float(np.hypot(p[0]-q[0], p[1]-q[1]))
+
+def open_camera_with_fallback(index_candidates, width, height):
+    if isinstance(index_candidates, int):
+        index_candidates = [index_candidates]
+    for idx in index_candidates:
+        cap = cv2.VideoCapture(idx, cv2.CAP_AVFOUNDATION)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH,  width)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+        ok = False
+        for _ in range(12):  # 웜업
+            ok, frame = cap.read()
+            if ok: break
+            time.sleep(0.1)
+        if ok:
+            print(f"[Info] 카메라 인덱스 {idx} 연결")
+            return cap, frame
+        cap.release()
+    raise RuntimeError("[Error] 카메라 프레임을 가져오지 못했습니다. 권한/다른 앱 점유/Continuity Camera 확인")
+
+# ---------------------- 메인 ----------------------
+def main():
+    global MIRROR, GRAVITY, REST_COEF
+
+    cap, frame = open_camera_with_fallback(CAM_INDEX_CANDIDATES, FRAME_W, FRAME_H)
+    H, W = frame.shape[:2]
+
+    mp_hands = mp.solutions.hands
+    hands = mp_hands.Hands(model_complexity=0, max_num_hands=1,
+                           min_detection_confidence=0.6, min_tracking_confidence=0.6)
+
+    # 2D 물리 상태
+    pos = np.array([W/2, H/3], dtype=np.float32)
+    vel = np.array([600.0, -200.0], dtype=np.float32)
+    radius = float(RADIUS_PX)
+
+    grabbed = False
+    prev_hand = None
+    prev_time = time.time()
+
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            # 재시도
+            try:
+                cap.release()
+                cap, frame = open_camera_with_fallback(CAM_INDEX_CANDIDATES, FRAME_W, FRAME_H)
+            except Exception as e:
+                print(e); break
+
+        if MIRROR:
+            frame = cv2.flip(frame, 1)
+
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        res = hands.process(rgb)
+
+        now = time.time()
+        dt = max(1e-3, now - prev_time)
+        prev_time = now
+
+        pinch = False
+        cur_hand_px = None
+        if res.multi_hand_landmarks:
+            lm = res.multi_hand_landmarks[0].landmark
+            ix, iy = int(lm[8].x*W), int(lm[8].y*H)   # 검지
+            tx, ty = int(lm[4].x*W), int(lm[4].y*H)   # 엄지
+            cur_hand_px = np.array([ix, iy], dtype=np.float32)
+            pinch = (l2((lm[8].x,lm[8].y), (lm[4].x,lm[4].y)) < PINCH_THRESH)
+
+        if cur_hand_px is not None:
+            cur_hand_px = ema(prev_hand, cur_hand_px, SMOOTHING)
+        prev_hand = cur_hand_px
+
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'): break
+        elif key == ord('m'): MIRROR = not MIRROR
+        elif key == ord('r'):
+            pos[:] = [W/2, H/3]; vel[:] = [0, 0]; grabbed = False
+        elif key == ord('g'): GRAVITY = max(0, GRAVITY - 200)
+        elif key == ord('G'): GRAVITY = min(4000, GRAVITY + 200)
+        elif key == ord('e'): REST_COEF = max(0.0, REST_COEF - 0.05)
+        elif key == ord('E'): REST_COEF = min(1.0, REST_COEF + 0.05)
+
+        # 잡기/해제
+        if cur_hand_px is not None:
+            inside = (np.hypot(cur_hand_px[0]-pos[0], cur_hand_px[1]-pos[1]) <= radius+8)
+            if pinch and not grabbed and inside:
+                grabbed = True
+            if not pinch:
+                grabbed = False
+
+        # 물리 업데이트
+        if grabbed and cur_hand_px is not None:
+            new_pos = cur_hand_px.copy()
+            vel = (new_pos - pos) / dt   # 손속도 추정 → 놓을 때 던진 느낌
+            pos = new_pos
+        else:
+            vel[1] += GRAVITY * dt
+            vel *= AIR_DRAG
+            pos += vel * dt
+
+            # 벽 충돌
+            if pos[0] < radius:
+                pos[0] = radius
+                vel[0] = -vel[0] * REST_COEF
+                vel[1] *= FRICTION_WALL
+            elif pos[0] > W - radius:
+                pos[0] = W - radius
+                vel[0] = -vel[0] * REST_COEF
+                vel[1] *= FRICTION_WALL
+
+            if pos[1] < radius:
+                pos[1] = radius
+                vel[1] = -vel[1] * REST_COEF
+                vel[0] *= FRICTION_WALL
+            elif pos[1] > H - radius:
+                pos[1] = H - radius
+                vel[1] = -vel[1] * REST_COEF
+                vel[0] *= FRICTION_WALL
+                if abs(vel[1]) < 20: vel[1] = 0  # 바닥 미세 진동 제거
+
+        # 화면 표시
+        show = frame.copy()
+        cv2.circle(show, (int(pos[0]), int(pos[1])), int(radius), (0,140,255), 2)
+        if cur_hand_px is not None:
+            cv2.circle(show, (int(cur_hand_px[0]), int(cur_hand_px[1])), 5, (255,255,255), -1)
+
+        tip = f"Pinch=grab/throw | g/G gravity:{GRAVITY:.0f}  e/E restitution:{REST_COEF:.2f}  r reset  m mirror  q quit"
+        cv2.putText(show, tip, (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255,255,255), 1, cv2.LINE_AA)
+        cv2.imshow("Bouncy Ball (2D Physics + Hand Grab)", show)
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    main()
+
+#python "/Users/shin-yeonho/Desktop/개발 자료/Virtual_Drawing3D.py" 을 입력하여 실행하기
+
